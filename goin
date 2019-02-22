@@ -1,0 +1,455 @@
+#! /usr/bin/env python3
+# -*- mode: python -*-
+
+import re
+from os import getuid, access as paccess, chdir, remove, rename as prename, R_OK, W_OK, symlink
+import sys
+from glob import glob
+import time
+import requests
+from os.path import join as pjoin, exists as pexists, abspath as pabs, getsize as fsize, expanduser, basename
+from collections import defaultdict
+
+DL_CHUNK_SIZE = 262144
+
+dl_page_url = 'https://golang.org/dl/'
+
+dl_op = {
+	'os': 'linux',     # TODO: detect running OS
+	'arch': 'amd64',   # TODO: detect running architechture
+	'version': 'latest', # latest
+	'tmp': '/tmp',
+}
+in_op = {
+	'prefix': '/usr/local',
+	'symlink': False,        # use update-alternatives first
+	'bin-dir': expanduser('~/.local/bin'), # in the user's home directory
+	'activate': False,
+	'alt-prio': 0,
+}
+
+sys_bin_dir = '/usr/local/bin'
+
+def print_usage(dl_op, in_op):
+	print('Usage: %s [options]' % sys.argv[0])
+	print()
+	print('Where options:')
+	print('  --arch           Select architechture \x1b[2m(default: %s)\x1b[m' % dl_op['arch'])
+	print('  --os             Select OS \x1b[2m(default: %s)\x1b[m' % dl_op['os'])
+	#print('  --uninstall      Remove an existing install')
+	print('  --version, -v    Select version \x1b[2m(default: %s)\x1b[m' % dl_op['version'])
+	print('  --tmp DIR        Use DIR as temporary storage during download \x1b[2m(default: %s)\x1b[m' % dl_op['tmp'])
+	print('  --installed, -l  List installed versions and exit\n')
+	print('  --available, -L  List available versions and exit\n')
+	print('  --prefix, -p     Set installation prefix \x1b[2m(default: %s)\x1b[m' % in_op['prefix'])
+	print('  --symlink, -s    Use symlinks (even if \'update-alternatives\' exist)')
+	print('  --activate       If using \'update-alternatives\', activate the newly installed version')
+	print('  --alt-prio       If using \'update-alternatives\', set the priority for the installed configurations')
+	print('  --bin-dir        Set directory for symlinks \x1b[2m(default: %s)\x1b[m' % in_op['bin-dir'])
+
+	print()
+	print('--activate: Sets the mode to "manual" and --alt-prio has no effect.')
+	sys.exit(0)
+
+class MissingValue(RuntimeError): pass
+	
+def opt_arg(arg, args):
+	if '=' in arg:
+		opt, arg = arg.split('=', 1)
+		return arg
+	try:
+		return next(args)
+	except StopIteration:
+		raise MissingValue(arg)
+
+def opt_islong(arg, name, value=False):
+	return arg == name or value and arg.startswith('%s=' % name)
+
+def parse_args(dl_op, in_op):
+	args = iter(sys.argv[1:])
+	while True:
+		try:
+			arg = next(args)
+		except StopIteration:
+			break
+
+		if arg in ('--help', '-h'):
+			print_usage(dl_op, in_op)
+
+		elif opt_islong(arg, '--arch', True):
+			arch = opt_arg(arg, args)
+			if arch == 'all':
+				arch = None
+			dl_op['arch'] = arch
+		elif opt_islong(arg, '--os', True):
+			os = opt_arg(arg, args)
+			if os == 'all':
+				os = None
+			dl_op['os'] = os
+		elif arg == '-v' or opt_islong(arg, '--version', True):
+			dl_op['version'] = opt_arg(arg, args)
+		elif arg in ('--installed', '-l'):
+			dl_op['list-installed'] = True
+		elif arg in ('--available', '-L'):
+			dl_op['list-available'] = True
+
+		elif arg in ('--symlink', '-s'):
+			in_op['symlink'] = True
+		elif arg in ('--activate'):
+			in_op['activate'] = True
+		elif opt_islong(arg, '--alt-prio', True):
+			in_op['alt-prio'] = int(opt_arg(arg, args))
+		elif arg == '-p' or opt_islong(arg, '--prefix', True):
+			in_op['prefix'] = pabs(opt_arg(arg, args))
+
+		elif arg == '-U' or opt_islong(arg, '--uninstall', True):
+			in_op['uninstall'] = opt_arg(arg, args)
+			
+		else:
+			print('Unknown argument: "%s"' % arg)
+			print_usage(dl_op, in_op)
+
+
+def fetch_available(url):
+	print('Fetching downloads... ', end='', flush=True)
+
+	resp = requests.get(url)
+	
+	page_html = resp.text
+	resp.close()
+	
+	url_ptn = re.compile(r'''<a.*? href="(?P<url>https://dl.google.com/go/(?P<filename>go(?P<version>[\d.]+)\.(?P<os>[a-z0-9]+)-(?P<arch>[a-z0-9]+)\.(?P<ext>[a-z0-9.]{3,10})))"''')
+
+	prev_ver = None
+	pkgs = {}
+	os_archs = {}  # { os: { arch: <groups> } }
+	for m in url_ptn.finditer(page_html):
+		m = m.groupdict()
+		if prev_ver != m['version']:
+			if os_archs:
+				pkgs[prev_ver] = os_archs
+			prev_ver = m['version']
+			os_archs = {}
+
+		os = m['os']
+		if os not in os_archs:
+			os_archs[os] = {}
+		os_archs[os][m['arch']] = m
+
+	print('done')
+	return pkgs
+
+def version_key(ver):
+	return [int(n) for n in ver[0].split('.')]
+
+def print_found(found, total):
+	if found < total:
+		if not found:
+			print('\x1b[33;1mFound no versions.\x1b[m')
+		else:
+			print('Found \x1b[1m%d\x1b[m version%s of a total %d versions.' % (found, ('s', '')[found == 1], total))
+
+
+def select_pkg(dl_pkgs, dl_op):
+	match_ver = lambda _: True
+	match_os = lambda _: True
+	match_arch = lambda _: True
+
+	first_version = None
+	
+	if re.search('[][.?*]', dl_op['version']) != None:  # seems to be a regexp
+		ptn = re.compile(dl_op['version'])
+		def match_ver(ver):
+			nonlocal first_version
+			if first_version is None:
+				first_version = ver
+			if dl_op['version'] == 'latest':
+				return first_version == ver
+			return ptn.search(ver) != None
+	else:
+		def match_ver(ver):
+			nonlocal first_version
+			if first_version is None:
+				first_version = ver
+			if dl_op['version'] == 'latest':
+				return first_version == ver
+			return ver == dl_op['version']  # direct comparison
+	if dl_op['os']:
+		match_os = lambda os: os == dl_op['os']
+	if dl_op['arch']:
+		match_arch = lambda arch: arch == dl_op['arch']
+	
+	if 'list-available' in dl_op:
+		found = 0
+		for version, os_archs in ((ver, os_archs) for ver, os_archs in sorted(dl_pkgs.items(), key=version_key, reverse=True) if match_ver(ver)):
+			os_archs = ' '.join('%s:%s' % (os, ','.join(arch for arch in sorted(os_archs[os]) if match_arch(arch))) for os in sorted(os_archs) if match_os(os))
+			if os_archs:
+				print(' \x1b[1m%-8s\x1b[m %s' % (version, os_archs))
+				found += 1
+
+		print_found(found, len(dl_pkgs))
+		sys.exit(0)
+
+
+	in_pkgs = []
+	for version, os_archs in ((ver, os_archs) for ver, os_archs in sorted(dl_pkgs.items(), key=version_key, reverse=True) if match_ver(ver)):
+		for os in (os for os in sorted(os_archs) if match_os(os)):
+			for arch in (arch for arch in sorted(os_archs[os]) if match_arch(arch)):
+				in_pkgs.append(os_archs[os][arch])
+
+	if len(in_pkgs) > 1:
+		print('Multiple versions matched (%d), select one:' % len(in_pkgs))
+
+		pkg_idx = 0
+		for pkg in in_pkgs:
+			print('\x1b[1m%3d\x1b[m      %-8s  %s/%s' % (pkg_idx + 1, pkg['version'], pkg['os'], pkg['arch']))
+			pkg_idx += 1
+
+		# TODO: menu selection?
+		try:
+			while True:
+				choice = input('Select version [%s]: ' % first_version) or '1'
+				try:
+					choice = int(choice)
+					if choice < 1 or choice > len(in_pkgs):
+						raise ValueError
+					break
+				except ValueError:
+					print('Try again')
+		except KeyboardInterrupt:
+			print()
+			return None
+
+		in_pkg = in_pkgs[choice - 1]
+	else:
+		in_pkg = in_pkgs[0]
+
+	return in_pkg
+
+
+def main():
+	if getuid() == 0:
+		in_op['bin-dir'] = sys_bin_dir
+
+
+	parse_args(dl_op, in_op)
+
+	if 'list-installed' in dl_op or 'uninstall' in in_op:
+		installed = glob(pjoin(in_op['prefix'], 'go-*'))
+		if 'list-installed' in dl_op:
+			if installed:
+				print('Installed Go versions in %s:' % in_op['prefix'])
+				print('\n'.join(installed))
+			else:
+				print('No versions of Go are installed in %s:' % in_op['prefix'])
+		else:
+			un_path = None
+			path_ptn = re.compile('^go-(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$')
+			for p in installed:
+				m = path_ptn.search(basename(p))
+				if m.group('version') == in_op['uninstall']:
+					un_path = p
+					break
+			if not un_path:
+				print('Version %s does not seem to be installed.' % in_op['uninstall'])
+				sys.exit(1)
+			if not paccess(in_op['prefix'], R_OK | W_OK):
+				print('Sorry, you don\'t have write-access to %s   (see -p)' % in_op['prefix'])
+				sys.exit(1)
+
+			print('Uninstalling %s' % un_path)
+			answer = input('Continue [y/N] ?')
+			if not answer or answer.lower()[0] != 'y':
+				print('Uninstall cancelled')
+				sys.exit(0)
+				
+			# TODO: remove directory 'un_path'
+				
+		sys.exit(0)
+	
+	in_pkg = select_pkg(fetch_available(dl_page_url), dl_op)
+	if not in_pkg:
+		print('Installation cancelled.')
+		sys.exit(0)
+
+	print()
+	print('Selected: \x1b[1m%s\x1b[m  %s/%s' % (in_pkg['version'], in_pkg['os'], in_pkg['arch']))
+	
+	######################################################################
+
+	installed = False
+	in_dir = pabs(pjoin(in_op['prefix'], 'go-%s' % in_pkg['version']))
+	if not pexists(in_dir):
+		# destination directory does not exist, let's install!
+	
+		local_file = pabs(pjoin(dl_op['tmp'], in_pkg['filename']))
+
+		# check if the file already exists
+		res = download_pkg(in_pkg, local_file)
+		if res is not True:
+			if res is False:
+				return 1
+			
+			elif isinstance(res, int):
+				print('\x1b[2mAlready downloaded: %s (%d MiB)\x1b[m' % (local_file, res>>20))
+		
+		######################################################################
+
+		installed = extract_pkg(in_pkg, local_file, in_op)
+	
+	else:
+		print('\x1b[33;1mAlready exists:\x1b[m %s' % in_dir)
+	
+	
+	bin_files = glob(pjoin(in_dir, 'bin', '*'))
+		
+	if getuid() == 0 and not in_op['symlink']:
+		# we're root, try to make in_dir/bin/* available system-wide
+		# first attempt to use update-alternative then fall back to symlinks
+
+		from subprocess import check_output
+		upalt = 'update-alternatives'
+		try:
+			check_output([upalt, '--version'])
+		except FileNotFoundError:
+			print('"update-alternatives" is not available, fall back to using symlinks.')
+			in_op['symlink'] = True
+
+		else:
+			print('Installing alternatives for binaries...', end='', flush=True)
+			for bin_name in bin_files:
+				name = basename(bin_name)
+				link_name = pjoin(in_op['bin-dir'], name)
+				# --install <link> <name> <path> <priority>
+				check_output([upalt, '--install', link_name, name, bin_name, str(in_op['alt-prio'])])
+				if in_op['activate']:
+					check_output([upalt, '--set', link_name])
+
+			print(' done')
+	else:
+		bin_dir = pjoin(expanduser(in_op['bin-dir']))
+		# if we're not root, we can't use update-alternatives
+		in_op['symlink'] = True
+
+
+	if in_op['symlink']:
+		if not paccess(in_op['bin-dir'], W_OK):
+			print('Sorry, you don\'t have write-access to %s' % in_op['bin-dir'])
+		else:
+			for bin_name in bin_files:
+				name = basename(bin_name)
+				link_name = pjoin(bin_dir, name)
+				try: remove(link_name)
+				except FileNotFoundError: pass
+
+				# point 'link_name' to the file 'bin_name'
+				print('  ', pjoin(bin_dir, name), '->', bin_name)
+				symlink(bin_name, link_name)
+		if not symlinks:
+			print('No symlinks were created?')
+
+	if installed:
+		print('\x1b[1mGo version %s is installed: %s\x1b[m' % (in_pkg['version'], in_dir))
+
+
+def download_pkg(pkg, local_file):
+	# TODO: extract tar while downloading, e.g.:
+	#   wget <file> | tar xf -
+
+	# get escape sequences for hide/show the cursor from the termcap database
+	import curses
+	curses.setupterm()
+	hide_cursor = curses.tigetstr('civis').decode('utf-8')
+	show_cursor = curses.tigetstr('cnorm').decode('utf-8')
+
+	print('Downloading: \x1b[1m%(version)s\x1b[m  [%(os)s/%(arch)s]   \x1b[2m%(url)s\x1b[m' % pkg)
+	try:
+		print(hide_cursor, end='', flush=True)
+
+		resp = requests.get(pkg['url'], stream=True)
+		if resp.status_code != 200:
+			return False
+
+		total_size = int(resp.headers['content-length'])
+
+		if pexists(local_file) and fsize(local_file) == total_size:
+			return total_size
+
+		curr_size = 0
+		progress_width = 60
+		progress_interval = 0.2
+		last_progress = time.perf_counter() - progress_interval
+
+		progress = mk_progress(total_size, progress_width)
+		
+		print('\x1b7\x1b[K', end='')  # save cursor position
+		with open(local_file, 'wb') as fp:
+			for chunk in resp.iter_content(chunk_size=DL_CHUNK_SIZE):
+				if not chunk: # ignore keep-alive chunks
+					continue
+				fp.write(chunk)
+				curr_size += len(chunk)
+				curr_progress = 100.0*curr_size / total_size
+				now = time.perf_counter()
+				if now - last_progress > progress_interval:
+					print('\x1b8', end='')  # restore cursor position
+					print('%s  ' % progress(curr_size), end='', flush=True)
+					last_progress = now
+		
+		print('\x1b8', end='')  # restore cursor position
+		print('\r%s' % progress(total_size))
+
+	except KeyboardInterrupt:
+		print('** Download cancelled by user')
+		if pexists(local_file):
+			remove(local_file)
+		return False
+
+	finally:
+		resp.close()
+		print(show_cursor, end='', flush=True)
+
+	return True
+
+def mk_progress(total, width):
+	bar_ch = ('▏', '▎', '▍', '▌', '▋', '▊', '▉', '█')
+	def gen(curr):
+		progress = curr/total
+		percent = 100*progress
+		bar_w = progress*width
+		bar = '%s%s' % (bar_ch[-1]*int(bar_w), bar_ch[int(bar_w % 1*(len(bar_ch)-1))])
+		return '%-60s %3d%% \x1b[2m%4d MiB\x1b[m' % (bar, percent, total>>20)
+	return gen
+
+
+def extract_pkg(pkg, local_file, in_op):
+	if not paccess(in_op['prefix'], R_OK | W_OK):
+		print('Sorry, you don\'t have write-access to %s   (see -p)' % in_op['prefix'])
+		sys.exit(1)
+
+	# TODO: handle other package formats
+
+	print('Extracting archive... ', end='', flush=True)
+	from tempfile import mkdtemp
+	tmp_dir = mkdtemp(prefix='goin-', dir=in_op['prefix'])
+	
+	chdir(tmp_dir)
+	
+	import tarfile
+	with tarfile.open(local_file, bufsize=65536) as tar:
+		tar.extractall()
+	
+	print('OK')
+	remove(local_file)
+
+	dest_dir = pjoin(in_op['prefix'], 'go-%s' % pkg['version'])
+	print('Installing as: %s' % dest_dir)
+	import shutil
+	shutil.move('go', dest_dir)
+	chdir('..')
+	shutil.rmtree(tmp_dir)
+
+
+if __name__ == '__main__':
+	main()
+
