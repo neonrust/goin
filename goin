@@ -2,18 +2,22 @@
 # -*- mode: python -*-
 
 import re
-from os import getuid, access as paccess, chdir, remove, rename as prename, R_OK, W_OK, symlink
+from os import getuid, access as paccess, chdir, remove, rename as prename, R_OK, W_OK, symlink, readlink
 import sys
 from glob import glob
 import time
 import requests
-from os.path import join as pjoin, exists as pexists, abspath as pabs, getsize as fsize, expanduser, basename
+from os.path import join as pjoin, exists as pexists, abspath as pabs, getsize as fsize, expanduser, basename, isdir, islink
 from collections import defaultdict
+from subprocess import check_output, check_call, DEVNULL
 
 DL_CHUNK_SIZE = 262144
 
 dl_page_url = 'https://golang.org/dl/'
 
+op = {
+	'yes': False,
+}
 dl_op = {
 	'os': 'linux',     # TODO: detect running OS
 	'arch': 'amd64',   # TODO: detect running architechture
@@ -28,31 +32,47 @@ in_op = {
 	'alt-prio': 0,
 }
 
+
 sys_bin_dir = '/usr/local/bin'
+
+upalt = 'update-alternatives'
+
 
 def print_usage(dl_op, in_op):
 	print('Usage: %s [options]' % sys.argv[0])
 	print()
-	print('Where options:')
-	print('  --arch           Select architechture \x1b[2m(default: %s)\x1b[m' % dl_op['arch'])
-	print('  --os             Select OS \x1b[2m(default: %s)\x1b[m' % dl_op['os'])
-	#print('  --uninstall      Remove an existing install')
-	print('  --version, -v    Select version \x1b[2m(default: %s)\x1b[m' % dl_op['version'])
-	print('  --tmp DIR        Use DIR as temporary storage during download \x1b[2m(default: %s)\x1b[m' % dl_op['tmp'])
-	print('  --installed, -l  List installed versions and exit\n')
-	print('  --available, -L  List available versions and exit\n')
-	print('  --prefix, -p     Set installation prefix \x1b[2m(default: %s)\x1b[m' % in_op['prefix'])
-	print('  --symlink, -s    Use symlinks (even if \'update-alternatives\' exist)')
+	print('General options:')
+	print('  -y, -f           Answer "Yes" to all confirmation questions')
+
+	print('Mode options:')
+	print('  --installed, -l  List installed versions and exit')
+	print('  --available, -L  List available versions and exit')
+	print('  --uninstall=VER, -U VER')
+	print('                   Remove an existing version and exit')
+	print('Version selection options:')
+	print('  --arch=ARCH      Select architechture \x1b[2m(default: %s)\x1b[m' % dl_op['arch'])
+	print('  --os=OS          Select OS \x1b[2m(default: %s)\x1b[m' % dl_op['os'])
+	print('  --version=VER, -v VER')
+	print()
+	print('  --prefix=PATH, -p PATH')
+	print('                   Use PATH as (un)install prefix \x1b[2m(default: %s)\x1b[m' % in_op['prefix'])
+	print('                   Select version \x1b[2m(default: %s)\x1b[m' % dl_op['version'])
+	print('Installation options:')
 	print('  --activate       If using \'update-alternatives\', activate the newly installed version')
 	print('  --alt-prio       If using \'update-alternatives\', set the priority for the installed configurations')
 	print('  --bin-dir        Set directory for symlinks \x1b[2m(default: %s)\x1b[m' % in_op['bin-dir'])
+	print('  --symlink, -s    Use symlinks (even if \'update-alternatives\' exist)')
+	print('  --tmp=DIR        Use DIR as temporary storage during download \x1b[2m(default: %s)\x1b[m' % dl_op['tmp'])
 
 	print()
-	print('--activate: Sets the mode to "manual" and --alt-prio has no effect.')
 	sys.exit(0)
 
-class MissingValue(RuntimeError): pass
-	
+class ArgumentError(RuntimeError): pass
+class MissingValue(ArgumentError):
+	def __str__(self):
+		return 'Argument "%s" requires a value' % self.args[0]
+
+
 def opt_arg(arg, args):
 	if '=' in arg:
 		opt, arg = arg.split('=', 1)
@@ -76,6 +96,16 @@ def parse_args(dl_op, in_op):
 		if arg in ('--help', '-h'):
 			print_usage(dl_op, in_op)
 
+		if arg in ('-y', '-f'):
+			op['yes'] = True
+			
+		elif arg in ('--installed', '-l'):
+			op['list-installed'] = True
+		elif arg in ('--available', '-L'):
+			op['list-available'] = True
+		elif arg == '-U' or opt_islong(arg, '--uninstall', True):
+			op['uninstall'] = opt_arg(arg, args)   # the version to uninstall
+
 		elif opt_islong(arg, '--arch', True):
 			arch = opt_arg(arg, args)
 			if arch == 'all':
@@ -88,10 +118,6 @@ def parse_args(dl_op, in_op):
 			dl_op['os'] = os
 		elif arg == '-v' or opt_islong(arg, '--version', True):
 			dl_op['version'] = opt_arg(arg, args)
-		elif arg in ('--installed', '-l'):
-			dl_op['list-installed'] = True
-		elif arg in ('--available', '-L'):
-			dl_op['list-available'] = True
 
 		elif arg in ('--symlink', '-s'):
 			in_op['symlink'] = True
@@ -101,9 +127,6 @@ def parse_args(dl_op, in_op):
 			in_op['alt-prio'] = int(opt_arg(arg, args))
 		elif arg == '-p' or opt_islong(arg, '--prefix', True):
 			in_op['prefix'] = pabs(opt_arg(arg, args))
-
-		elif arg == '-U' or opt_islong(arg, '--uninstall', True):
-			in_op['uninstall'] = opt_arg(arg, args)
 			
 		else:
 			print('Unknown argument: "%s"' % arg)
@@ -150,13 +173,17 @@ def print_found(found, total):
 			print('Found \x1b[1m%d\x1b[m version%s of a total %d versions.' % (found, ('s', '')[found == 1], total))
 
 
-def select_pkg(dl_pkgs, dl_op):
-	match_ver = lambda _: True
-	match_os = lambda _: True
+def mk_matchers(dl_op):
 	match_arch = lambda _: True
+	match_os = lambda _: True
+	match_ver = lambda _: True
 
 	first_version = None
 	
+	if dl_op['arch']:
+		match_arch = lambda arch: arch == dl_op['arch']
+	if dl_op['os']:
+		match_os = lambda os: os == dl_op['os']
 	if re.search('[][.?*]', dl_op['version']) != None:  # seems to be a regexp
 		ptn = re.compile(dl_op['version'])
 		def match_ver(ver):
@@ -174,22 +201,11 @@ def select_pkg(dl_pkgs, dl_op):
 			if dl_op['version'] == 'latest':
 				return first_version == ver
 			return ver == dl_op['version']  # direct comparison
-	if dl_op['os']:
-		match_os = lambda os: os == dl_op['os']
-	if dl_op['arch']:
-		match_arch = lambda arch: arch == dl_op['arch']
-	
-	if 'list-available' in dl_op:
-		found = 0
-		for version, os_archs in ((ver, os_archs) for ver, os_archs in sorted(dl_pkgs.items(), key=version_key, reverse=True) if match_ver(ver)):
-			os_archs = ' '.join('%s:%s' % (os, ','.join(arch for arch in sorted(os_archs[os]) if match_arch(arch))) for os in sorted(os_archs) if match_os(os))
-			if os_archs:
-				print(' \x1b[1m%-8s\x1b[m %s' % (version, os_archs))
-				found += 1
 
-		print_found(found, len(dl_pkgs))
-		sys.exit(0)
+	return match_arch, match_os, match_ver
 
+def select_pkg(dl_pkgs, dl_op):
+	match_arch, match_os, match_ver = mk_matchers(dl_op)
 
 	in_pkgs = []
 	for version, os_archs in ((ver, os_archs) for ver, os_archs in sorted(dl_pkgs.items(), key=version_key, reverse=True) if match_ver(ver)):
@@ -232,40 +248,31 @@ def main():
 		in_op['bin-dir'] = sys_bin_dir
 
 
-	parse_args(dl_op, in_op)
+	try:
+		parse_args(dl_op, in_op)
+	except ArgumentError as ae:
+		print(str(ae), file=sys.stderr)
+		sys.exit(1)
 
-	if 'list-installed' in dl_op or 'uninstall' in in_op:
-		installed = glob(pjoin(in_op['prefix'], 'go-*'))
-		if 'list-installed' in dl_op:
-			if installed:
-				print('Installed Go versions in %s:' % in_op['prefix'])
-				print('\n'.join(installed))
-			else:
-				print('No versions of Go are installed in %s:' % in_op['prefix'])
-		else:
-			un_path = None
-			path_ptn = re.compile('^go-(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$')
-			for p in installed:
-				m = path_ptn.search(basename(p))
-				if m.group('version') == in_op['uninstall']:
-					un_path = p
-					break
-			if not un_path:
-				print('Version %s does not seem to be installed.' % in_op['uninstall'])
-				sys.exit(1)
-			if not paccess(in_op['prefix'], R_OK | W_OK):
-				print('Sorry, you don\'t have write-access to %s   (see -p)' % in_op['prefix'])
-				sys.exit(1)
+	if 'list-available' in op:
+		match_arch, match_os, match_ver = mk_matchers(dl_op)
+		found = 0
+		for version, os_archs in ((ver, os_archs) for ver, os_archs in sorted(dl_pkgs.items(), key=version_key, reverse=True) if match_ver(ver)):
+			os_archs = ' '.join('%s:%s' % (os, ','.join(arch for arch in sorted(os_archs[os]) if match_arch(arch))) for os in sorted(os_archs) if match_os(os))
+			if os_archs:
+				print(' \x1b[1m%-8s\x1b[m %s' % (version, os_archs))
+				found += 1
 
-			print('Uninstalling %s' % un_path)
-			answer = input('Continue [y/N] ?')
-			if not answer or answer.lower()[0] != 'y':
-				print('Uninstall cancelled')
-				sys.exit(0)
-				
-			# TODO: remove directory 'un_path'
-				
+		print_found(found, len(dl_pkgs))
 		sys.exit(0)
+		
+	if 'list-installed' in op or 'uninstall' in op:
+		if 'list-installed' in op:
+			res = list_installed(in_op['prefix'], in_op['bin-dir'])
+		else:
+			res = uninstall(op['uninstall'], in_op)
+
+		sys.exit(0 if res else 1)
 	
 	in_pkg = select_pkg(fetch_available(dl_page_url), dl_op)
 	if not in_pkg:
@@ -307,12 +314,8 @@ def main():
 		# we're root, try to make in_dir/bin/* available system-wide
 		# first attempt to use update-alternative then fall back to symlinks
 
-		from subprocess import check_output
-		upalt = 'update-alternatives'
-		try:
-			check_output([upalt, '--version'])
-		except FileNotFoundError:
-			print('"update-alternatives" is not available, fall back to using symlinks.')
+		upalt = detect_update_alt()
+		if not upalt:
 			in_op['symlink'] = True
 
 		else:
@@ -321,9 +324,9 @@ def main():
 				name = basename(bin_name)
 				link_name = pjoin(in_op['bin-dir'], name)
 				# --install <link> <name> <path> <priority>
-				check_output([upalt, '--install', link_name, name, bin_name, str(in_op['alt-prio'])])
+				check_output([upalt, '--install', link_name, name, bin_name, str(in_op['alt-prio'])], stderr=DEVNULL)
 				if in_op['activate']:
-					check_output([upalt, '--set', link_name])
+					check_output([upalt, '--set', name, bin_name], stderr=DEVNULL)
 
 			print(' done')
 	else:
@@ -345,12 +348,118 @@ def main():
 				# point 'link_name' to the file 'bin_name'
 				print('  ', pjoin(bin_dir, name), '->', bin_name)
 				symlink(bin_name, link_name)
-		if not symlinks:
-			print('No symlinks were created?')
 
 	if installed:
 		print('\x1b[1mGo version %s is installed: %s\x1b[m' % (in_pkg['version'], in_dir))
 
+
+def confirm(question):
+	if op['yes']:
+		print('\x1b[2m%s Yes\x1b[m' % question)
+		return True
+
+	answer = input(question)
+	return answer and answer.lower()[0] == 'y'
+
+def detect_update_alt():
+	try:
+		check_call([upalt, '--version'], stdout=DEVNULL)
+		return upalt
+	except FileNotFoundError:
+		return None
+
+
+def get_installed(prefix):
+	return [p for p in glob(pjoin(prefix, 'go-*')) if isdir(p)]
+
+
+def list_installed(prefix, bin_dir):
+	installed = get_installed(in_op['prefix'])
+
+	if installed:
+		print('Installed Go versions in %s:' % prefix)
+		for p in installed:
+			print(' ', p, end='')
+			binaries = active_bins(p, bin_dir)
+			if binaries:
+				print('  (%s)' % ', '.join(binaries))
+			else:
+				print()
+		return True
+	else:
+		print('No versions of Go are installed in %s' % prefix)
+		return False
+
+
+def active_bins(path, bin_dir):
+	in_bin_dir = pjoin(path, 'bin')
+
+	active = []
+
+	upalt = detect_update_alt()
+	if upalt:
+		for bin_path in glob(pjoin(in_bin_dir, '*')):
+			name = basename(bin_path)
+			for line in check_output([upalt, '--query', name], stderr=DEVNULL).splitlines():
+				line = line.decode('utf-8')
+				if line.startswith('Value: %s' % in_bin_dir):
+					active.append(name)
+					break
+	else:
+		all_bins = [b for b in glob(pjoin(in_bin_dir), '*') if islink(b)]
+		for name in all_bins:
+			if readlink(name).startswith(in_bin_dir):
+				active.append(name)
+
+	return active
+	
+
+def uninstall(version, in_op):
+	installed = get_installed(in_op['prefix'])
+
+	un_path = None
+	path_ptn = re.compile('^go-(?P<version>[0-9]+\.[0-9]+(\.[0-9]+)?)$')
+	for p in installed:
+		m = path_ptn.search(basename(p))
+		if not m:
+			print('"%s" does not match version regexp' % p)
+			continue
+		if m.group('version') == version:
+			un_path = p
+			break
+	if not un_path:
+		print('Version %s does not seem to be installed in %s (try -l).' % (version, in_op['prefix']))
+		return False
+	if not paccess(in_op['prefix'], R_OK | W_OK):
+		print('Sorry, you don\'t have write-access to %s' % in_op['prefix'])
+		return False
+
+	print('Uninstalling %s' % un_path)
+	if not confirm('Continue [y/N] ? '):
+		print('Uninstall cancelled')
+		return False
+
+	print('Uninstalling... ', end='', flush=True)
+
+	bin_dir = pjoin(un_path, 'bin')
+	upalt = detect_update_alt()
+	if not in_op['symlink'] or upalt:
+		bin_files = glob(pjoin(bin_dir, '*'))
+		for bin_name in bin_files:
+			check_output([upalt, '--remove', basename(bin_name), pjoin(bin_dir, bin_name)])
+	else:
+		removed = 0
+		for name in lsdir(in_op['bin-dir']):
+			if islink(name) and os.readlink(name).startswith(bin_dir + '/'):
+				remove(name)
+	
+	import shutil
+	shutil.rmtree(un_path)
+
+	print('done')
+	return True
+
+		
 
 def download_pkg(pkg, local_file):
 	# TODO: extract tar while downloading, e.g.:
