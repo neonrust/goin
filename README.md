@@ -2,6 +2,8 @@
 
 GO INstaller.
 
+It's tested (and tuned) to run on Ubuntu.
+Requires Python 3.x.
 
 ## Help
 
