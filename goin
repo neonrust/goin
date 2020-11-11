@@ -8,6 +8,7 @@ from glob import glob
 import time
 import requests
 from os.path import join as pjoin, exists as pexists, abspath as pabs, getsize as fsize, expanduser, basename, isdir, islink
+from urllib.parse import urljoin
 from collections import defaultdict
 from subprocess import check_output, check_call, DEVNULL, CalledProcessError
 from tempfile import TemporaryFile
@@ -102,7 +103,6 @@ def parse_args(dl_op, in_op):
 
 		if arg in ('-y', '-f'):
 			op['yes'] = True
-			
 		elif arg in ('--installed', '-l'):
 			op['list-installed'] = True
 		elif arg in ('--available', '-L'):
@@ -131,7 +131,6 @@ def parse_args(dl_op, in_op):
 			in_op['alt-prio'] = int(opt_arg(arg, args))
 		elif arg == '-p' or opt_islong(arg, '--prefix', True):
 			in_op['prefix'] = pabs(opt_arg(arg, args))
-			
 		else:
 			print('Unknown argument: "%s"' % arg)
 			print_usage(dl_op, in_op)
@@ -141,11 +140,11 @@ def fetch_available(url):
 	print('Fetching downloads... ', end='', flush=True)
 
 	resp = requests.get(url)
-	
+
 	page_html = resp.text
 	resp.close()
-	
-	url_ptn = re.compile(r'''<a.*? href="(?P<url>https://dl.google.com/go/(?P<filename>go(?P<version>[\d.]+)\.(?P<os>[a-z0-9]+)-(?P<arch>[a-z0-9]+)\.(?P<ext>[a-z0-9.]{3,10})))"''')
+
+	url_ptn = re.compile(r'''<a.*? href="(?P<url>.*?/(?P<filename>go(?P<version>[\d.]+)\.(?P<os>[a-z0-9]+)-(?P<arch>[a-z0-9]+)\.(?P<ext>[a-z0-9.]{3,10})))"''')
 
 	prev_ver = None
 	pkgs = {}
@@ -161,6 +160,7 @@ def fetch_available(url):
 		os = m['os']
 		if os not in os_archs:
 			os_archs[os] = {}
+		m['url'] = urljoin(url, m['url'])
 		os_archs[os][m['arch']] = m
 
 	print('done')
@@ -183,7 +183,7 @@ def mk_matchers(dl_op):
 	match_ver = lambda _: True
 
 	first_version = None
-	
+
 	if dl_op['arch']:
 		match_arch = lambda arch: arch == dl_op['arch']
 
@@ -273,11 +273,18 @@ def main():
 		match_arch, match_os, match_ver = mk_matchers(dl_op)
 		found = 0
 		dl_pkgs = fetch_available(dl_page_url)
+		if not dl_pkgs:
+			print('No Go versions found!?!')
+			sys.exit(1)
 		matched_versions = (
 			(ver, os_archs)
 			for ver, os_archs in sorted(dl_pkgs.items(), key=version_key, reverse=True)
 			if match_ver(ver)
 		)
+		if not matched_versions:
+			print('No Go versions matched (of %d versions)' % len(dl_pkgs))
+			sys.exit(1)
+
 		for version, os_archs in matched_versions:
 			os_archs = ' '.join('%s:%s' % (os, ','.join(arch for arch in sorted(os_archs[os]) if match_arch(arch))) for os in sorted(os_archs) if match_os(os))
 			if os_archs:
@@ -300,7 +307,7 @@ def main():
 			res = uninstall(op['uninstall'], in_op)
 
 		sys.exit(0 if res else 1)
-	
+
 	in_pkg = select_pkg(fetch_available(dl_page_url), dl_op)
 	if not in_pkg:
 		print('Installation cancelled.')
@@ -308,14 +315,14 @@ def main():
 
 	print()
 	print('Selected: \x1b[1m%s\x1b[m  %s/%s' % (in_pkg['version'], in_pkg['os'], in_pkg['arch']))
-	
+
 	######################################################################
 
 	installed = False
 	in_dir = pabs(pjoin(in_op['prefix'], 'go-%s' % in_pkg['version']))
 	if not pexists(in_dir):
 		# destination directory does not exist, let's install!
-	
+
 		local_file = pabs(pjoin(dl_op['tmp'], in_pkg['filename']))
 
 		# check if the file already exists
@@ -323,20 +330,20 @@ def main():
 		if res is not True:
 			if res is False:
 				return 1
-			
+
 			elif isinstance(res, int):
 				print('\x1b[2mAlready downloaded: %s (%d MiB)\x1b[m' % (local_file, res>>20))
-		
+
 		######################################################################
 
 		installed = extract_pkg(in_pkg, local_file, in_op)
-	
+
 	else:
 		print('\x1b[33;1mAlready exists:\x1b[m %s' % in_dir)
-	
-	
+
+
 	bin_files = glob(pjoin(in_dir, 'bin', '*'))
-		
+
 	if getuid() == 0 and not in_op['symlink']:
 		# we're root, try to make in_dir/bin/* available system-wide
 		# first attempt to use update-alternative then fall back to symlinks
@@ -449,7 +456,7 @@ def active_bins(path, bin_dir):
 				active.append(name)
 
 	return active
-	
+
 
 def uninstall(version, in_op):
 	installed = get_installed(in_op['prefix'])
@@ -490,14 +497,14 @@ def uninstall(version, in_op):
 		for name in lsdir(in_op['bin-dir']):
 			if islink(name) and os.readlink(name).startswith(bin_dir + '/'):
 				remove(name)
-	
+
 	import shutil
 	shutil.rmtree(un_path)
 
 	print('done')
 	return True
 
-		
+
 
 def download_pkg(pkg, local_file):
 	# TODO: extract tar while downloading, e.g.:
@@ -528,7 +535,7 @@ def download_pkg(pkg, local_file):
 		last_progress = time.perf_counter() - progress_interval
 
 		progress = mk_progress(total_size, progress_width)
-		
+
 		print('\x1b7\x1b[K', end='')  # save cursor position
 		with open(local_file, 'wb') as fp:
 			for chunk in resp.iter_content(chunk_size=DL_CHUNK_SIZE):
@@ -542,7 +549,7 @@ def download_pkg(pkg, local_file):
 					print('\x1b8', end='')  # restore cursor position
 					print('%s  ' % progress(curr_size), end='', flush=True)
 					last_progress = now
-		
+
 		print('\x1b8', end='')  # restore cursor position
 		print('\r%s' % progress(total_size))
 
@@ -580,13 +587,13 @@ def extract_pkg(pkg, local_file, in_op):
 	print('Extracting archive... ', end='', flush=True)
 	from tempfile import mkdtemp
 	tmp_dir = mkdtemp(prefix='goin-', dir=in_op['prefix'])
-	
+
 	chdir(tmp_dir)
-	
+
 	import tarfile
 	with tarfile.open(local_file, bufsize=65536) as tar:
 		tar.extractall()
-	
+
 	print('OK')
 	remove(local_file)
 
@@ -600,4 +607,3 @@ def extract_pkg(pkg, local_file, in_op):
 
 if __name__ == '__main__':
 	main()
-
