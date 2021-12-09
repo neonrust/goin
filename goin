@@ -11,25 +11,26 @@ from os.path import join as pjoin, exists as pexists, abspath as pabs, getsize a
 from collections import defaultdict
 from subprocess import check_output, check_call, DEVNULL, CalledProcessError
 from tempfile import TemporaryFile
+from urllib.parse import urljoin
 
 DL_CHUNK_SIZE = 262144
 
-dl_page_url = 'https://golang.org/dl/'
+dl_page_url = 'https://go.dev/dl/'
 
 op = {
 	'yes': False,
 }
 dl_op = {
-	'os': 'linux',     # TODO: detect running OS
-	'arch': 'amd64',   # TODO: detect running architechture
+	'os': 'linux',
+	'arch': 'amd64',
 	'version': None,   # -L matches all, installation uses latest
 	'tmp': '/tmp',
 }
 in_op = {
-	'prefix': '/usr/local',
+	'prefix': expanduser('~/.local'),
 	'symlink': False,        # use update-alternatives first
 	'bin-dir': expanduser('~/.local/bin'), # in the user's home directory
-	'activate': False,
+	'activate': True,
 	'alt-prio': 0,
 }
 
@@ -40,56 +41,81 @@ upalt = 'update-alternatives'
 
 
 def print_usage(dl_op, in_op):
-	print('Usage: %s [options]' % sys.argv[0])
+	print('Usage: %s [command] [options]' % sys.argv[0])
 	print()
-	print('General options:')
-	print('  -y, -f           Answer "Yes" to all confirmation questions')
-
-	print('Mode options:')
-	print('  --installed, -l  List installed versions and exit')
-	print('  --available, -L  List available versions and exit')
-	print('  --uninstall=VER, -U VER')
-	print('                   Remove an existing version and exit')
+	print('With no arguments, installs the latest version.')
 	print()
-	print('Version selection options:')
-	print('  --arch=ARCH      Select/filter architechture \x1b[2m(%s)\x1b[m' % dl_op['arch'])
-	print('  --os=OS          Select/filter OS \x1b[2m(%s)\x1b[m' % dl_op['os'])
+	print('\x1b[1mGeneral options:\x1b[m')
+	print('  -y, -f             Answer "Yes" to all confirmation questions')
+	print()
+	print('\x1b[1mCommands:\x1b[m')
+	print('  [install]          Install matching version')
+	print('  list               List locally installed versions')
+	#print('  --installed, -L    List installed versions')
+	print('  available          List available versions for installation')
+	#print('  --available, -A    List available versions')
+	print('  uninstall VER      Uninstall a installed version')
+	print('  switch VER         Switch to/activate the specified installed version')
+	print()
+	print('\x1b[1mVersion selection options:\x1b[m')
+	print('  --arch=ARCH        Select/filter architechture \x1b[2m(%s)\x1b[m' % dl_op['arch'])
+	print('  --os=OS            Select/filter OS \x1b[2m(%s)\x1b[m' % dl_op['os'])
 	print('  --version=VER, -v VER')
-	print('                   Select/filter version \x1b[2m(%s)\x1b[m' % dl_op['version'])
-	print('                   Regular expression autodetected')
-	print('Installation options:')
+	print('                     Select/filter version \x1b[2m(%s)\x1b[m' % dl_op['version'])
+	print('                     Regular expression autodetected')
+	print()
+	print('\x1b[1mInstallation options:\x1b[m')
 	print('  --prefix=PATH, -p PATH')
-	print('                   Use PATH as (un)install prefix \x1b[2m(%s)\x1b[m' % in_op['prefix'])
-	print('  --activate       If using \'update-alternatives\', activate the')
-	print('                   newly installed version')
-	print('  --alt-prio       If using \'update-alternatives\', set priority')
-	print('                   for the installed configurations')
-	print('  --bin-dir        Set directory for symlinks \x1b[2m(%s)\x1b[m' % in_op['bin-dir'])
-	print('  --symlink, -s    Use symlinks (even if \'update-alternatives\' exist)')
-	print('  --tmp=DIR        Use DIR as temporary storage during download \x1b[2m(%s)\x1b[m' % dl_op['tmp'])
+	print('                     Use PATH as (un)install prefix \x1b[2m(%s)\x1b[m' % in_op['prefix'])
+	print('  --activate         Activate the just-installed version (default: auto)')
+	print('  --no-activate      Skip activation of just-installed version')
+	print('  --alt-prio         If using \'update-alternatives\', set priority')
+	print('                     for the installed configurations')
+	print('  --bin-dir          Set directory for symlinks \x1b[2m(%s)\x1b[m' % in_op['bin-dir'])
+	print('  --symlink, -s      Use symlinks (even if \'update-alternatives\' exist)')
+	print('  --tmp=DIR          Use DIR as temporary storage during download \x1b[2m(%s)\x1b[m' % dl_op['tmp'])
 
 	print()
 	sys.exit(0)
+
 
 class ArgumentError(RuntimeError): pass
 class MissingValue(ArgumentError):
 	def __str__(self):
 		return 'Argument "%s" requires a value' % self.args[0]
 
-
-def opt_arg(arg, args):
+def opt_arg(arg, args, name=None):
 	if '=' in arg:
 		opt, arg = arg.split('=', 1)
 		return arg
 	try:
 		return next(args)
 	except StopIteration:
-		raise MissingValue(arg)
+		raise MissingValue(name or arg)
+
 
 def opt_islong(arg, name, value=False):
 	return arg == name or value and arg.startswith('%s=' % name)
 
+
 def parse_args(dl_op, in_op):
+
+	command = 'install'
+
+	commands = {
+		'install': 'install',
+		'uninstall': 'uninstall',
+		'list': 'list-installed',
+		'available': 'list-available',
+	}
+	def match_command(name):
+		for cmd in commands:
+			if cmd.startswith(name):
+				return cmd, commands[cmd]
+
+		return (None, None)
+
+	command = False
 	args = iter(sys.argv[1:])
 	while True:
 		try:
@@ -103,12 +129,17 @@ def parse_args(dl_op, in_op):
 		if arg in ('-y', '-f'):
 			op['yes'] = True
 			
-		elif arg in ('--installed', '-l'):
-			op['list-installed'] = True
-		elif arg in ('--available', '-L'):
-			op['list-available'] = True
-		elif arg == '-U' or opt_islong(arg, '--uninstall', True):
-			op['uninstall'] = opt_arg(arg, args)   # the version to uninstall
+		elif not command and arg[0] != '-':
+			cmd_name, cmd_op = match_command(arg)
+			if cmd_op:
+				if cmd_op == 'uninstall':
+					op[cmd_op] = opt_arg(arg, args, name=cmd_name)   # the version to uninstall
+				else:
+					op[cmd_op] = True
+			else:
+				print('\x1b[31;1mUnknown command: \x1b[m"%s"  (use on of: %s)' % (arg, ', '.join(commands.keys())))
+				print_usage(dl_op, in_op)
+			command = True
 
 		elif opt_islong(arg, '--arch', True):
 			arch = opt_arg(arg, args)
@@ -127,13 +158,15 @@ def parse_args(dl_op, in_op):
 			in_op['symlink'] = True
 		elif arg in ('--activate'):
 			in_op['activate'] = True
+		elif arg in ('--no-activate'):
+			in_op['activate'] = False
 		elif opt_islong(arg, '--alt-prio', True):
 			in_op['alt-prio'] = int(opt_arg(arg, args))
 		elif arg == '-p' or opt_islong(arg, '--prefix', True):
 			in_op['prefix'] = pabs(opt_arg(arg, args))
 			
 		else:
-			print('Unknown argument: "%s"' % arg)
+			print('\x1b[31;1mUnknown argument: \x1b[m"%s"' % arg)
 			print_usage(dl_op, in_op)
 
 
@@ -263,6 +296,7 @@ def main():
 	if getuid() == 0:
 		in_op['bin-dir'] = sys_bin_dir
 
+	dl_op['os'], dl_op['arch'] = detect_platform()
 
 	try:
 		parse_args(dl_op, in_op)
@@ -343,6 +377,7 @@ def main():
 		
 	if getuid() == 0 and not in_op['symlink']:
 		# we're root, try to make in_dir/bin/* available system-wide
+
 		# first attempt to use update-alternative then fall back to symlinks
 
 		upalt = detect_update_alt()
@@ -391,6 +426,36 @@ def confirm(question):
 
 	answer = input(question)
 	return answer and answer.lower()[0] == 'y'
+
+
+def detect_platform():
+	def _os():
+		kernel = check_output(['uname', '-s']).decode('utf-8').lower()
+		if 'linux' in kernel:
+			return 'linux'
+		elif 'darwin' in kernel:
+			return 'darwin'
+		elif 'windows' in kernel:
+			return 'windows'
+
+		raise RuntimeError('Couldn\'t detect OS (kernel): %s' % kernel)
+
+	def _arch():
+		arch = check_output(['uname', '-m']).decode('utf-8').lower()
+		if arch in ('i386', 'i486', 'i586', 'i686'):
+			arch = '386'
+		else:
+			# let's assume we're on amd64, it's very likely to be true
+			arch = 'amd64'
+
+		# NOTE: there's also releases for PPC, ARM and s390,
+		#   but let's not go overboard with this detection...
+
+		return arch
+
+	return _os(), _arch()
+
+
 
 def detect_update_alt():
 	try:
@@ -469,7 +534,8 @@ def uninstall(version, in_op):
 			un_path = p
 			break
 	if not un_path:
-		print('Version %s does not seem to be installed in %s (try -l).' % (version, in_op['prefix']))
+		print('Version %s does not seem to be installed in %s (see "list").' % (version, in_op['prefix']))
+		print('Also, try setting another prefix using "--prefix".')
 		return False
 	if not paccess(in_op['prefix'], R_OK | W_OK):
 		print('Sorry, you don\'t have write-access to %s' % in_op['prefix'])
@@ -517,7 +583,11 @@ def download_pkg(pkg, local_file):
 	try:
 		print(hide_cursor, end='', flush=True)
 
-		resp = requests.get(pkg['url'], stream=True)
+		url = pkg['url']
+		if not url.startswith('http'):
+			url = urljoin(dl_page_url, url)
+
+		resp = requests.get(url, stream=True)
 		if resp.status_code != 200:
 			return False
 
