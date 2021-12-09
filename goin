@@ -41,7 +41,7 @@ upalt = 'update-alternatives'
 
 
 def print_usage(dl_op, in_op):
-	print('Usage: %s [command] [options]' % sys.argv[0])
+	print('Usage: %s [command] [options]' % basename(sys.argv[0]))
 	print()
 	print('With no arguments, installs the latest version.')
 	print()
@@ -49,7 +49,7 @@ def print_usage(dl_op, in_op):
 	print('  -y, -f             Answer "Yes" to all confirmation questions')
 	print()
 	print('\x1b[1mCommands:\x1b[m')
-	print('  [install]          Install matching version')
+	print('  [install]          Install matching version (the default)')
 	print('  list               List locally installed versions')
 	#print('  --installed, -L    List installed versions')
 	print('  available          List available versions for installation')
