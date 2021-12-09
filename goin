@@ -141,16 +141,18 @@ def fetch_available(url):
 	print('Fetching downloads... ', end='', flush=True)
 
 	resp = requests.get(url)
-	
+
 	page_html = resp.text
 	resp.close()
-	
-	url_ptn = re.compile(r'''<a.*? href="(?P<url>https://dl.google.com/go/(?P<filename>go(?P<version>[\d.]+)\.(?P<os>[a-z0-9]+)-(?P<arch>[a-z0-9]+)\.(?P<ext>[a-z0-9.]{3,10})))"''')
 
+	url_ptn = re.compile(r'''<a.*? href="(?P<url>/dl/(?P<filename>go(?P<version>[\d.]+)\.(?P<os>[a-z0-9]+)-(?P<arch>[a-z0-9]+)\.(?P<ext>[a-z0-9.]{3,10})))"''')
+
+	found_links = 0
 	prev_ver = None
 	pkgs = {}
 	os_archs = {}  # { os: { arch: <groups> } }
 	for m in url_ptn.finditer(page_html):
+		found_links += 1
 		m = m.groupdict()
 		if prev_ver != m['version']:
 			if os_archs:
@@ -164,6 +166,8 @@ def fetch_available(url):
 		os_archs[os][m['arch']] = m
 
 	print('done')
+	if not found_links:
+		print('\x1b[41;97;1mNo download links found!\x1b[m', file=sys.stderr)
 	return pkgs
 
 def version_key(ver):
