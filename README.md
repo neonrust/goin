@@ -8,70 +8,61 @@ Requires Python 3.x.
 ## Help
 
     # goin --help
-    Usage: ./goin [options]
-
+    Usage: goin [command] [options]
+    
+    With no arguments, installs the latest version.
+    
     General options:
-      -y, -f           Answer "Yes" to all confirmation questions
-    Mode options:
-      --installed, -l  List installed versions and exit
-      --available, -L  List available versions and exit
-      --uninstall=VER, -U VER
-                       Remove an existing version and exit
-
+      -y, -f             Answer "Yes" to all confirmation questions
+    
+    Commands:
+      [install]          Install matching version
+      list               List locally installed versions
+      available          List available versions for installation
+      uninstall VER      Uninstall a installed version
+      switch VER         Switch to/activate the specified installed version
+    
     Version selection options:
-      --arch=ARCH      Select/filter architechture (amd64)
-      --os=OS          Select/filter OS (linux)
+      --arch=ARCH        Select/filter architechture (amd64)
+      --os=OS            Select/filter OS (linux)
       --version=VER, -v VER
-                       Select/filter version (None)
-                       Regular expression autodetected
+                         Select/filter version (None)
+                         Regular expression autodetected
+    
     Installation options:
       --prefix=PATH, -p PATH
-                       Use PATH as (un)install prefix (/usr/local)
-      --activate       If using 'update-alternatives', activate the
-                       newly installed version
-      --alt-prio       If using 'update-alternatives', set priority
-                       for the installed configurations
-      --bin-dir        Set directory for symlinks (/home/andjonss/.local/bin)
-      --symlink, -s    Use symlinks (even if 'update-alternatives' exist)
-      --tmp=DIR        Use DIR as temporary storage during download (/tmp)
-
+                         Use PATH as (un)install prefix (/home/andjonss/.local)
+      --activate         Activate the just-installed version (default: auto)
+      --no-activate      Skip activation of just-installed version
+      --alt-prio         If using 'update-alternatives', set priority
+                         for the installed configurations
+      --bin-dir          Set directory for symlinks (/home/andjonss/.local/bin)
+      --symlink, -s      Use symlinks (even if 'update-alternatives' exist)
+      --tmp=DIR          Use DIR as temporary storage during download (/tmp)
+    
 
 ## Installing
 
-Installs the Latest available version by default:
+Without arguments, it installs the latest available version, for the
+current user:
 
-    # goin
-	Fetching downloads... done
-
-    Selected: 1.13.5  linux/amd64
-    Downloading: 1.13.5  [linux/amd64]   https://dl.google.com/go/go1.13.5.linux-amd64.tar.gz
-    ████████████████████████████████████████████████████████████▏ 100%  114 MiB
-    Sorry, you don't have write-access to /usr/local   (see -p)
-    Try running the same command with "sudo".
-
-And redoing the same with 'sudo' will resume and conclude the
-installation. The downloaded file is stored locally (currently, in
-/tmp), thus not downloaded again.
-
-The 'Fetching downloads' appears because it always checks for new
-versions upon startup.
-
-    # sudo goin
-    [sudo] password for THEUSER:
+    goin --version 1.15.4                                                                           ~
     Fetching downloads... done
-
-    Selected: 1.13.5  linux/amd64
-    Downloading: 1.13.5  [linux/amd64]   https://dl.google.com/go/go1.13.5.linux-amd64.tar.gz
-    Already downloaded: /tmp/go1.13.5.linux-amd64.tar.gz (114 MiB)
+    
+    Selected: 1.15.4  linux/amd64
+    Downloading: 1.15.4  [linux/amd64]   /dl/go1.15.4.linux-amd64.tar.gz
+    ████████████████████████████████████████████████████████████▏ 100%  115 MiB 
     Extracting archive... OK
-    Installing as: /usr/local/go-1.13.5
-    Installing alternatives for binaries... done
+    Installing as: /home/andjonss/.local/go-1.15.4
+       /home/myself/.local/bin/gofmt -> /home/myself/.local/go-1.15.4/bin/gofmt
+       /home/myself/.local/bin/go -> /home/myself/.local/go-1.15.4/bin/go
 
-    # go version                                                                                                          ~/devel/goin
-    go version go1.13.5 linux/amd64
+The -p/--prefix option allows using a system-global prefix,
+e.g. /usr/local. This will of course require root privileges (i.e. use
+'sudo')
 
 Listing installed versions:
 
-	#./goin -l                                                                                                           ~/devel/goin
+	#./goin list
     Installed Go versions in /usr/local:
-      /usr/local/go-1.13.5  (go, gofmt)
+      /home/myself/.local/go-1.15.4  (go, gofmt)
